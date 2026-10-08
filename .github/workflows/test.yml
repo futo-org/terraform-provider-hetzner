@@ -76,9 +76,12 @@ jobs:
     needs: build
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 50
     strategy:
       fail-fast: false
+      # Every leg runs against the same persistent test server, so concurrent legs
+      # undo each other's boot configs and contend on its firewall.
+      max-parallel: 1
       matrix:
         terraform:
           - '1.13.*'
@@ -98,5 +101,6 @@ jobs:
           TF_ACC: "1"
           HETZNER_ROBOT_USERNAME: ${{ secrets.HETZNER_ROBOT_USERNAME }}
           HETZNER_ROBOT_PASSWORD: ${{ secrets.HETZNER_ROBOT_PASSWORD }}
-        run: go test -v -cover -run 'TestAcc' ./internal/provider/
-        timeout-minutes: 10
+        # Robot firewall changes alone take several minutes; go test defaults to 10m.
+        run: go test -v -cover -timeout 40m -run 'TestAcc' ./internal/provider/
+        timeout-minutes: 45
