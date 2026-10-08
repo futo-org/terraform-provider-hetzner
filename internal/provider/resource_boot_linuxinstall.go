@@ -246,15 +246,29 @@ func (r *bootLinuxResource) Update(ctx context.Context, req resource.UpdateReque
 		return
 	}
 
+	active, err := bootActive(r.client, serverNum, "linux")
+	if err != nil {
+		resp.Diagnostics.AddError("Error reading Linux boot config", err.Error())
+		return
+	}
+	if !active {
+		plan.Active = types.BoolValue(false)
+		plan.Password = types.StringNull()
+		resp.Diagnostics.AddWarning("Linux install activation already used",
+			fmt.Sprintf("Server %d has booted the installer since it was armed, so the new settings were saved "+
+				"without arming it again (arming reinstalls the server on its next boot). Use -replace to arm an install.", serverNum))
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		return
+	}
+
 	// Deactivate first
-	_, err := r.client.Delete(fmt.Sprintf("/boot/%d/linux", serverNum))
+	_, err = r.client.Delete(fmt.Sprintf("/boot/%d/linux", serverNum))
 	if err != nil {
 		resp.Diagnostics.AddError("Error deactivating Linux install", err.Error())
 		return
 	}
 
 	// Reactivate with new settings
-
 	body, err := r.client.Post(fmt.Sprintf("/boot/%d/linux", serverNum), data)
 	if err != nil {
 		resp.Diagnostics.AddError("Error reactivating Linux install", err.Error())

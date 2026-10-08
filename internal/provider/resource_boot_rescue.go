@@ -248,15 +248,29 @@ func (r *bootRescueResource) Update(ctx context.Context, req resource.UpdateRequ
 		return
 	}
 
+	active, err := bootActive(r.client, serverNum, "rescue")
+	if err != nil {
+		resp.Diagnostics.AddError("Error reading rescue system", err.Error())
+		return
+	}
+	if !active {
+		plan.Active = types.BoolValue(false)
+		plan.Password = types.StringNull()
+		resp.Diagnostics.AddWarning("Rescue activation already used",
+			fmt.Sprintf("Server %d has booted the rescue system since it was armed, so the new settings were saved "+
+				"without arming it again. Use -replace to arm rescue for the next boot.", serverNum))
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		return
+	}
+
 	// Deactivate first
-	_, err := r.client.Delete(fmt.Sprintf("/boot/%d/rescue", serverNum))
+	_, err = r.client.Delete(fmt.Sprintf("/boot/%d/rescue", serverNum))
 	if err != nil {
 		resp.Diagnostics.AddError("Error deactivating rescue system", err.Error())
 		return
 	}
 
 	// Reactivate with new settings
-
 	body, err := r.client.Post(fmt.Sprintf("/boot/%d/rescue", serverNum), data)
 	if err != nil {
 		resp.Diagnostics.AddError("Error reactivating rescue system", err.Error())
@@ -294,24 +308,12 @@ func (r *bootRescueResource) Delete(ctx context.Context, req resource.DeleteRequ
 	if err != nil {
 		// Booting into rescue consumes the activation, so by destroy time it is
 		// usually gone already; only an error that leaves it armed is a failure.
-		if active, readErr := r.isActive(serverNum); readErr == nil && !active {
+		if active, readErr := bootActive(r.client, serverNum, "rescue"); readErr == nil && !active {
 			return
 		}
 		resp.Diagnostics.AddError("Error deactivating rescue system", err.Error())
 		return
 	}
-}
-
-func (r *bootRescueResource) isActive(serverNum int64) (bool, error) {
-	body, err := r.client.Get(fmt.Sprintf("/boot/%d/rescue", serverNum))
-	if err != nil {
-		return false, err
-	}
-	var apiResp rescueAPIResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return false, err
-	}
-	return apiResp.Rescue.Active, nil
 }
 
 func (r *bootRescueResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
