@@ -64,6 +64,7 @@ func (p *batch2TestProvider) Resources(_ context.Context) []func() resource.Reso
 		NewSubnetResource,
 		NewFailoverResource,
 		NewServerOrderResource,
+		NewServerNameResource,
 		NewServerAddonResource,
 		NewIPMACResource,
 		NewSubnetMACResource,

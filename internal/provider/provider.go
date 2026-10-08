@@ -115,6 +115,7 @@ func (p *HetznerProvider) Resources(ctx context.Context) []func() resource.Resou
 		NewFailoverResource,
 		// Batch 4: server ordering
 		NewServerOrderResource,
+		NewServerNameResource,
 		NewServerAddonResource,
 		// Batch 3: boot configs
 		NewBootRescueResource,
