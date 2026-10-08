@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strings"
 	"testing"
@@ -241,6 +242,48 @@ resource "hetzner_boot_rescue" "test" {
 				Check: func(_ *terraform.State) error {
 					if len(sent) != 1 || strings.Join(sent[0], ",") != "aa:bb,cc:dd" {
 						return fmt.Errorf("authorized_key[] sent = %v, want one POST with [aa:bb cc:dd]", sent)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+func TestUnitBootRescueResource_AuthorizedKeysUnknownAtPlan(t *testing.T) {
+	var sent []url.Values
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			_ = r.ParseForm()
+			sent = append(sent, r.PostForm)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"rescue": map[string]interface{}{
+				"server_ip": "1.2.3.4", "server_number": 123, "os": "linux", "active": true,
+			},
+		})
+	}))
+	defer ts.Close()
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: batch3ProviderFactories(ts),
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "terraform_data" "single" {
+  input = null
+}
+
+resource "hetzner_boot_rescue" "test" {
+  server_number   = 123
+  os              = "linux"
+  authorized_key  = terraform_data.single.output
+  authorized_keys = ["aa:bb"]
+}`,
+				Check: func(_ *terraform.State) error {
+					if len(sent) != 1 || sent[0].Has("authorized_key") || strings.Join(sent[0]["authorized_key[]"], ",") != "aa:bb" {
+						return fmt.Errorf("rescue POSTs = %v, want one with only authorized_key[]=aa:bb", sent)
 					}
 					return nil
 				},

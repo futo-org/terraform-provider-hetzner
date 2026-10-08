@@ -12,6 +12,9 @@ import (
 )
 
 func checkAuthorizedKeysConflict(single types.String, list types.List, diags *diag.Diagnostics) {
+	if single.IsUnknown() || list.IsUnknown() {
+		return
+	}
 	if !single.IsNull() && !list.IsNull() {
 		diags.AddAttributeError(frameworkPath("authorized_keys"), "Conflicting attributes",
 			"Set either authorized_key or authorized_keys, not both.")
