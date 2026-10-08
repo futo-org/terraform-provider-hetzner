@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
@@ -20,9 +21,10 @@ import (
 )
 
 var (
-	_ resource.Resource                = &bootLinuxResource{}
-	_ resource.ResourceWithConfigure   = &bootLinuxResource{}
-	_ resource.ResourceWithImportState = &bootLinuxResource{}
+	_ resource.Resource                   = &bootLinuxResource{}
+	_ resource.ResourceWithConfigure      = &bootLinuxResource{}
+	_ resource.ResourceWithImportState    = &bootLinuxResource{}
+	_ resource.ResourceWithValidateConfig = &bootLinuxResource{}
 )
 
 type bootLinuxResource struct {
@@ -30,15 +32,16 @@ type bootLinuxResource struct {
 }
 
 type bootLinuxResourceModel struct {
-	ServerNumber  types.Int64  `tfsdk:"server_number"`
-	Dist          types.String `tfsdk:"dist"`
-	Lang          types.String `tfsdk:"lang"`
-	Arch          types.Int64  `tfsdk:"arch"`
-	AuthorizedKey types.String `tfsdk:"authorized_key"`
-	ServerIP      types.String `tfsdk:"server_ip"`
-	ServerIPv6Net types.String `tfsdk:"server_ipv6_net"`
-	Active        types.Bool   `tfsdk:"active"`
-	Password      types.String `tfsdk:"password"`
+	ServerNumber   types.Int64  `tfsdk:"server_number"`
+	Dist           types.String `tfsdk:"dist"`
+	Lang           types.String `tfsdk:"lang"`
+	Arch           types.Int64  `tfsdk:"arch"`
+	AuthorizedKey  types.String `tfsdk:"authorized_key"`
+	AuthorizedKeys types.List   `tfsdk:"authorized_keys"`
+	ServerIP       types.String `tfsdk:"server_ip"`
+	ServerIPv6Net  types.String `tfsdk:"server_ipv6_net"`
+	Active         types.Bool   `tfsdk:"active"`
+	Password       types.String `tfsdk:"password"`
 }
 
 type linuxAPIResponse struct {
@@ -87,7 +90,12 @@ func (r *bootLinuxResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Optional:            true,
 			},
 			"authorized_key": schema.StringAttribute{
-				MarkdownDescription: "SSH key fingerprint(s) for authentication.",
+				MarkdownDescription: "SSH key fingerprint for authentication. Conflicts with `authorized_keys`.",
+				Optional:            true,
+			},
+			"authorized_keys": schema.ListAttribute{
+				MarkdownDescription: "SSH key fingerprints for authentication. Conflicts with `authorized_key`.",
+				ElementType:         types.StringType,
 				Optional:            true,
 			},
 			"server_ip": schema.StringAttribute{
@@ -129,6 +137,26 @@ func (r *bootLinuxResource) Configure(_ context.Context, req resource.ConfigureR
 	r.client = c
 }
 
+func (r *bootLinuxResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var config bootLinuxResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	checkAuthorizedKeysConflict(config.AuthorizedKey, config.AuthorizedKeys, &resp.Diagnostics)
+}
+
+func linuxForm(ctx context.Context, plan bootLinuxResourceModel) (url.Values, diag.Diagnostics) {
+	data := url.Values{}
+	data.Set("dist", plan.Dist.ValueString())
+	data.Set("lang", plan.Lang.ValueString())
+
+	if !plan.Arch.IsNull() && !plan.Arch.IsUnknown() {
+		data.Set("arch", strconv.FormatInt(plan.Arch.ValueInt64(), 10))
+	}
+	return data, addAuthorizedKeys(ctx, data, plan.AuthorizedKey, plan.AuthorizedKeys)
+}
+
 func (r *bootLinuxResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan bootLinuxResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -137,15 +165,10 @@ func (r *bootLinuxResource) Create(ctx context.Context, req resource.CreateReque
 	}
 
 	serverNum := plan.ServerNumber.ValueInt64()
-	data := url.Values{}
-	data.Set("dist", plan.Dist.ValueString())
-	data.Set("lang", plan.Lang.ValueString())
-
-	if !plan.Arch.IsNull() && !plan.Arch.IsUnknown() {
-		data.Set("arch", strconv.FormatInt(plan.Arch.ValueInt64(), 10))
-	}
-	if !plan.AuthorizedKey.IsNull() && !plan.AuthorizedKey.IsUnknown() {
-		data.Set("authorized_key", plan.AuthorizedKey.ValueString())
+	data, diags := linuxForm(ctx, plan)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
 
 	body, err := r.client.Post(fmt.Sprintf("/boot/%d/linux", serverNum), data)
@@ -217,6 +240,11 @@ func (r *bootLinuxResource) Update(ctx context.Context, req resource.UpdateReque
 	}
 
 	serverNum := plan.ServerNumber.ValueInt64()
+	data, diags := linuxForm(ctx, plan)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	// Deactivate first
 	_, err := r.client.Delete(fmt.Sprintf("/boot/%d/linux", serverNum))
@@ -226,16 +254,6 @@ func (r *bootLinuxResource) Update(ctx context.Context, req resource.UpdateReque
 	}
 
 	// Reactivate with new settings
-	data := url.Values{}
-	data.Set("dist", plan.Dist.ValueString())
-	data.Set("lang", plan.Lang.ValueString())
-
-	if !plan.Arch.IsNull() && !plan.Arch.IsUnknown() {
-		data.Set("arch", strconv.FormatInt(plan.Arch.ValueInt64(), 10))
-	}
-	if !plan.AuthorizedKey.IsNull() && !plan.AuthorizedKey.IsUnknown() {
-		data.Set("authorized_key", plan.AuthorizedKey.ValueString())
-	}
 
 	body, err := r.client.Post(fmt.Sprintf("/boot/%d/linux", serverNum), data)
 	if err != nil {
@@ -289,6 +307,7 @@ func (r *bootLinuxResource) ImportState(ctx context.Context, req resource.Import
 	state.Lang = types.StringNull()
 	state.Arch = types.Int64Null()
 	state.AuthorizedKey = types.StringNull()
+	state.AuthorizedKeys = types.ListNull(types.StringType)
 	state.ServerIP = types.StringNull()
 	state.ServerIPv6Net = types.StringNull()
 	state.Active = types.BoolNull()

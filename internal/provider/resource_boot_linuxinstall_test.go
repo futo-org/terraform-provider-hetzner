@@ -5,11 +5,15 @@ package provider
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
 func newTestBootLinuxServer() *httptest.Server {
@@ -121,6 +125,55 @@ data "hetzner_boot_linux" "test" {
 					resource.TestCheckResourceAttr("data.hetzner_boot_linux.test", "server_ip", "1.2.3.4"),
 					resource.TestCheckResourceAttr("data.hetzner_boot_linux.test", "active", "false"),
 				),
+			},
+		},
+	})
+}
+
+func TestUnitBootLinuxResource_AuthorizedKeys(t *testing.T) {
+	var sent [][]string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			_ = r.ParseForm()
+			sent = append(sent, r.PostForm["authorized_key[]"])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"linux": map[string]interface{}{
+				"server_ip": "1.2.3.4", "server_number": 123, "dist": "Debian 13 base", "lang": "en", "active": true,
+			},
+		})
+	}))
+	defer ts.Close()
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: batch3ProviderFactories(ts),
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "hetzner_boot_linux" "test" {
+  server_number   = 123
+  dist            = "Debian 13 base"
+  lang            = "en"
+  authorized_key  = "aa:bb"
+  authorized_keys = ["cc:dd"]
+}`,
+				ExpectError: regexp.MustCompile(`Set either authorized_key or authorized_keys`),
+			},
+			{
+				Config: `
+resource "hetzner_boot_linux" "test" {
+  server_number   = 123
+  dist            = "Debian 13 base"
+  lang            = "en"
+  authorized_keys = ["aa:bb", "cc:dd"]
+}`,
+				Check: func(_ *terraform.State) error {
+					if len(sent) != 1 || strings.Join(sent[0], ",") != "aa:bb,cc:dd" {
+						return fmt.Errorf("authorized_key[] sent = %v, want one POST with [aa:bb cc:dd]", sent)
+					}
+					return nil
+				},
 			},
 		},
 	})

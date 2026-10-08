@@ -129,10 +129,7 @@ func (r *bootRescueResource) ValidateConfig(ctx context.Context, req resource.Va
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if !config.AuthorizedKey.IsNull() && !config.AuthorizedKeys.IsNull() {
-		resp.Diagnostics.AddAttributeError(frameworkPath("authorized_keys"), "Conflicting attributes",
-			"Set either authorized_key or authorized_keys, not both.")
-	}
+	checkAuthorizedKeysConflict(config.AuthorizedKey, config.AuthorizedKeys, &resp.Diagnostics)
 }
 
 func rescueForm(ctx context.Context, plan bootRescueResourceModel) (url.Values, diag.Diagnostics) {
@@ -143,16 +140,7 @@ func rescueForm(ctx context.Context, plan bootRescueResourceModel) (url.Values, 
 	if !plan.Arch.IsNull() && !plan.Arch.IsUnknown() {
 		data.Set("arch", strconv.FormatInt(plan.Arch.ValueInt64(), 10))
 	}
-	if !plan.AuthorizedKey.IsNull() && !plan.AuthorizedKey.IsUnknown() {
-		data.Set("authorized_key", plan.AuthorizedKey.ValueString())
-	}
-	if !plan.AuthorizedKeys.IsNull() && !plan.AuthorizedKeys.IsUnknown() {
-		var keys []string
-		diags.Append(plan.AuthorizedKeys.ElementsAs(ctx, &keys, false)...)
-		for _, k := range keys {
-			data.Add("authorized_key[]", k)
-		}
-	}
+	diags.Append(addAuthorizedKeys(ctx, data, plan.AuthorizedKey, plan.AuthorizedKeys)...)
 	if !plan.Keyboard.IsNull() && !plan.Keyboard.IsUnknown() {
 		data.Set("keyboard", plan.Keyboard.ValueString())
 	}
