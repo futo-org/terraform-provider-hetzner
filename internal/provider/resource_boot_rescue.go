@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
@@ -20,9 +21,10 @@ import (
 )
 
 var (
-	_ resource.Resource                = &bootRescueResource{}
-	_ resource.ResourceWithConfigure   = &bootRescueResource{}
-	_ resource.ResourceWithImportState = &bootRescueResource{}
+	_ resource.Resource                   = &bootRescueResource{}
+	_ resource.ResourceWithConfigure      = &bootRescueResource{}
+	_ resource.ResourceWithImportState    = &bootRescueResource{}
+	_ resource.ResourceWithValidateConfig = &bootRescueResource{}
 )
 
 type bootRescueResource struct {
@@ -30,15 +32,16 @@ type bootRescueResource struct {
 }
 
 type bootRescueResourceModel struct {
-	ServerNumber  types.Int64  `tfsdk:"server_number"`
-	OS            types.String `tfsdk:"os"`
-	Arch          types.Int64  `tfsdk:"arch"`
-	AuthorizedKey types.String `tfsdk:"authorized_key"`
-	Keyboard      types.String `tfsdk:"keyboard"`
-	ServerIP      types.String `tfsdk:"server_ip"`
-	ServerIPv6Net types.String `tfsdk:"server_ipv6_net"`
-	Active        types.Bool   `tfsdk:"active"`
-	Password      types.String `tfsdk:"password"`
+	ServerNumber   types.Int64  `tfsdk:"server_number"`
+	OS             types.String `tfsdk:"os"`
+	Arch           types.Int64  `tfsdk:"arch"`
+	AuthorizedKey  types.String `tfsdk:"authorized_key"`
+	AuthorizedKeys types.List   `tfsdk:"authorized_keys"`
+	Keyboard       types.String `tfsdk:"keyboard"`
+	ServerIP       types.String `tfsdk:"server_ip"`
+	ServerIPv6Net  types.String `tfsdk:"server_ipv6_net"`
+	Active         types.Bool   `tfsdk:"active"`
+	Password       types.String `tfsdk:"password"`
 }
 
 func NewBootRescueResource() resource.Resource {
@@ -69,7 +72,12 @@ func (r *bootRescueResource) Schema(_ context.Context, _ resource.SchemaRequest,
 				Optional:            true,
 			},
 			"authorized_key": schema.StringAttribute{
-				MarkdownDescription: "SSH key fingerprint(s) for authentication.",
+				MarkdownDescription: "SSH key fingerprint for authentication. Conflicts with `authorized_keys`.",
+				Optional:            true,
+			},
+			"authorized_keys": schema.ListAttribute{
+				MarkdownDescription: "SSH key fingerprints for authentication. Conflicts with `authorized_key`.",
+				ElementType:         types.StringType,
 				Optional:            true,
 			},
 			"keyboard": schema.StringAttribute{
@@ -115,6 +123,30 @@ func (r *bootRescueResource) Configure(_ context.Context, req resource.Configure
 	r.client = c
 }
 
+func (r *bootRescueResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var config bootRescueResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	checkAuthorizedKeysConflict(config.AuthorizedKey, config.AuthorizedKeys, &resp.Diagnostics)
+}
+
+func rescueForm(ctx context.Context, plan bootRescueResourceModel) (url.Values, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	data := url.Values{}
+	data.Set("os", plan.OS.ValueString())
+
+	if !plan.Arch.IsNull() && !plan.Arch.IsUnknown() {
+		data.Set("arch", strconv.FormatInt(plan.Arch.ValueInt64(), 10))
+	}
+	diags.Append(addAuthorizedKeys(ctx, data, plan.AuthorizedKey, plan.AuthorizedKeys)...)
+	if !plan.Keyboard.IsNull() && !plan.Keyboard.IsUnknown() {
+		data.Set("keyboard", plan.Keyboard.ValueString())
+	}
+	return data, diags
+}
+
 type rescueAPIResponse struct {
 	Rescue rescueAPIData `json:"rescue"`
 }
@@ -137,17 +169,10 @@ func (r *bootRescueResource) Create(ctx context.Context, req resource.CreateRequ
 	}
 
 	serverNum := plan.ServerNumber.ValueInt64()
-	data := url.Values{}
-	data.Set("os", plan.OS.ValueString())
-
-	if !plan.Arch.IsNull() && !plan.Arch.IsUnknown() {
-		data.Set("arch", strconv.FormatInt(plan.Arch.ValueInt64(), 10))
-	}
-	if !plan.AuthorizedKey.IsNull() && !plan.AuthorizedKey.IsUnknown() {
-		data.Set("authorized_key", plan.AuthorizedKey.ValueString())
-	}
-	if !plan.Keyboard.IsNull() && !plan.Keyboard.IsUnknown() {
-		data.Set("keyboard", plan.Keyboard.ValueString())
+	data, diags := rescueForm(ctx, plan)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
 
 	body, err := r.client.Post(fmt.Sprintf("/boot/%d/rescue", serverNum), data)
@@ -217,28 +242,35 @@ func (r *bootRescueResource) Update(ctx context.Context, req resource.UpdateRequ
 	}
 
 	serverNum := plan.ServerNumber.ValueInt64()
+	data, diags := rescueForm(ctx, plan)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	active, err := bootActive(r.client, serverNum, "rescue")
+	if err != nil {
+		resp.Diagnostics.AddError("Error reading rescue system", err.Error())
+		return
+	}
+	if !active {
+		plan.Active = types.BoolValue(false)
+		plan.Password = types.StringNull()
+		resp.Diagnostics.AddWarning("Rescue activation already used",
+			fmt.Sprintf("Server %d has booted the rescue system since it was armed, so the new settings were saved "+
+				"without arming it again. Use -replace to arm rescue for the next boot.", serverNum))
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		return
+	}
 
 	// Deactivate first
-	_, err := r.client.Delete(fmt.Sprintf("/boot/%d/rescue", serverNum))
+	_, err = r.client.Delete(fmt.Sprintf("/boot/%d/rescue", serverNum))
 	if err != nil {
 		resp.Diagnostics.AddError("Error deactivating rescue system", err.Error())
 		return
 	}
 
 	// Reactivate with new settings
-	data := url.Values{}
-	data.Set("os", plan.OS.ValueString())
-
-	if !plan.Arch.IsNull() && !plan.Arch.IsUnknown() {
-		data.Set("arch", strconv.FormatInt(plan.Arch.ValueInt64(), 10))
-	}
-	if !plan.AuthorizedKey.IsNull() && !plan.AuthorizedKey.IsUnknown() {
-		data.Set("authorized_key", plan.AuthorizedKey.ValueString())
-	}
-	if !plan.Keyboard.IsNull() && !plan.Keyboard.IsUnknown() {
-		data.Set("keyboard", plan.Keyboard.ValueString())
-	}
-
 	body, err := r.client.Post(fmt.Sprintf("/boot/%d/rescue", serverNum), data)
 	if err != nil {
 		resp.Diagnostics.AddError("Error reactivating rescue system", err.Error())
@@ -274,6 +306,11 @@ func (r *bootRescueResource) Delete(ctx context.Context, req resource.DeleteRequ
 	serverNum := state.ServerNumber.ValueInt64()
 	_, err := r.client.Delete(fmt.Sprintf("/boot/%d/rescue", serverNum))
 	if err != nil {
+		// Booting into rescue consumes the activation, so by destroy time it is
+		// usually gone already; only an error that leaves it armed is a failure.
+		if active, readErr := bootActive(r.client, serverNum, "rescue"); readErr == nil && !active {
+			return
+		}
 		resp.Diagnostics.AddError("Error deactivating rescue system", err.Error())
 		return
 	}
@@ -291,6 +328,7 @@ func (r *bootRescueResource) ImportState(ctx context.Context, req resource.Impor
 	state.OS = types.StringNull()
 	state.Arch = types.Int64Null()
 	state.AuthorizedKey = types.StringNull()
+	state.AuthorizedKeys = types.ListNull(types.StringType)
 	state.Keyboard = types.StringNull()
 	state.ServerIP = types.StringNull()
 	state.ServerIPv6Net = types.StringNull()

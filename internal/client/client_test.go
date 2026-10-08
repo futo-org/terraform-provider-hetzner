@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 )
 
@@ -133,5 +134,54 @@ func TestUnitGetWithContextAPIError(t *testing.T) {
 	}
 	if apiErr.ErrorCode != "NOT_FOUND" {
 		t.Errorf("expected error code NOT_FOUND, got %s", apiErr.ErrorCode)
+	}
+}
+
+func TestUnitGetCached(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		n := hits
+		mu.Unlock()
+		fmt.Fprintf(w, `{"read":%d}`, n)
+	}))
+	defer server.Close()
+
+	c := NewClient("user", "pass")
+	c.BaseURL = server.URL
+
+	var wg sync.WaitGroup
+	bodies := make([]string, 20)
+	for i := range bodies {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body, err := c.GetCached("/server")
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			bodies[i] = string(body)
+		}(i)
+	}
+	wg.Wait()
+
+	if hits != 1 {
+		t.Fatalf("expected 1 request for 20 concurrent reads, got %d", hits)
+	}
+	for _, b := range bodies {
+		if b != `{"read":1}` {
+			t.Fatalf("unexpected body: %s", b)
+		}
+	}
+
+	c.ForgetCached("/server")
+	body, err := c.GetCached("/server")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(body) != `{"read":2}` || hits != 2 {
+		t.Fatalf("expected a fresh read after ForgetCached, got %s after %d requests", body, hits)
 	}
 }
